@@ -34,21 +34,8 @@ This repository implements a **Rule-First Architecture** with **Groq Rate-Limiti
 The workflow is built on top of a LangGraph `StateGraph`. Incoming user symptom messages are analyzed, checked for acute conditions, routed dynamically, enhanced with local clinical guidance, and compiled into a structured clinical output.
 
 ### Data Flow Diagram
-```mermaid
-graph TD
-    Start([POST /api/v1/triage]) --> RuleCheck{1. Rule Engine Check}
-    
-    RuleCheck -- "Rule Match (Conf >= 0.8)" --> ReturnRule[Return Deterministic Response]
-    RuleCheck -- "No Rule Match" --> AnalyzeNode[2. Analyze Node]
-    
-    AnalyzeNode --> EmergencyCheck{3. Emergency Keyword / LLM Check?}
-    
-    EmergencyCheck -- "Yes (Critical Emergency)" --> TriageNode[5. Triage Node (Bypasses Search)]
-    EmergencyCheck -- "No (Standard)" --> SearchNode[4. Medical DB Search Node]
-    
-    SearchNode --> TriageNode
-    TriageNode --> ReturnLLM[Return LLM Response]
-```
+<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/1566b8fb-a5c5-416b-88b0-849034f1eb54" />
+
 
 ### LangGraph Node Definition
 1.  **Symptom Analyzer (`analyze_node`)**: Inspects symptoms to see if they constitute an emergency (e.g., crushing chest pain) and builds a 2-4 keyword database search query.
