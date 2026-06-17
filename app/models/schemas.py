@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional, TypedDict
+from typing import Any, List, Optional, TypedDict
 from pydantic import BaseModel, Field, field_validator
 
 class UrgencyLevel(str, Enum):
@@ -55,6 +55,8 @@ class TriageResponse(TriageAssessment):
         ...,
         description="Unique identifier for the patient matching the request."
     )
+    local_triage_used: Optional[bool] = None
+
 
 class SymptomAnalysis(BaseModel):
     is_critical: bool = Field(
@@ -77,6 +79,9 @@ class TriageState(TypedDict):
     search_results: Optional[str]
     triage_response: Optional[TriageResponse]
     errors: List[str]
+    features: Optional[Any]
+    local_triage_used: Optional[bool]
+
 
 class ProcessingMetrics(BaseModel):
     total_cases: int
@@ -93,4 +98,8 @@ class BatchTriageResponse(BaseModel):
     groq_calls_used: Optional[int] = None
     groq_calls_saved: Optional[int] = None
     llm_budget_exhausted: Optional[bool] = None
+    local_triage_used: Optional[int] = None
+    llm_triage_used: Optional[int] = None
+    local_triage_saved_calls: Optional[int] = None
+
 

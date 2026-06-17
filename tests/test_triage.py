@@ -149,7 +149,7 @@ def test_batch_triage_rate_limiting(monkeypatch):
     mock_cases = [
         {"patient_id": "case_rule", "message": "I have crushing chest pain that radiates to my left arm."},
         {"patient_id": "case_llm_1", "message": "I feel a bit dizzy and tired."},
-        {"patient_id": "case_fallback", "message": "My throat is ticklish and I have a minor cough."}
+        {"patient_id": "case_fallback", "message": "I feel a strange buzzing in my elbow when I snap my fingers."}
     ]
     
     from app.services.cases import CasesService
@@ -189,3 +189,54 @@ def test_batch_triage_rate_limiting(monkeypatch):
     assert fb["red_flags"] == []
     assert fb["confidence"] == 0.50
     assert "screening" in fb["disclaimer"].lower() or "clinical" in fb["disclaimer"].lower()
+
+def test_hybrid_triage_routing():
+    """
+    Verifies Phase 1 Hybrid Triage Engine routing:
+    - Emergency chest pain matches local rules and skips LLM.
+    - Severe bleeding matches local rules/indicators and skips LLM.
+    - Simple fever matches local rules and skips LLM.
+    - Unknown symptom does not match rules and calls the LLM.
+    """
+    # 1. Emergency chest pain
+    payload = {
+        "patient_id": "pat_chest_pain",
+        "message": "I have crushing chest pain and it radiates to my jaw."
+    }
+    response = client.post("/api/v1/triage", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["local_triage_used"] is True
+    assert data["urgency"] == UrgencyLevel.EMERGENCY.value
+
+    # 2. Severe bleeding
+    payload = {
+        "patient_id": "pat_severe_bleeding",
+        "message": "I am bleeding heavily from a wound and it won't stop."
+    }
+    response = client.post("/api/v1/triage", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["local_triage_used"] is True
+    assert data["urgency"] == UrgencyLevel.EMERGENCY.value
+
+    # 3. Simple fever
+    payload = {
+        "patient_id": "pat_simple_fever",
+        "message": "I have a fever of 100F since yesterday."
+    }
+    response = client.post("/api/v1/triage", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["local_triage_used"] is True
+    assert data["urgency"] in [UrgencyLevel.NON_URGENT.value, UrgencyLevel.URGENT.value]
+
+    # 4. Unknown symptom
+    payload = {
+        "patient_id": "pat_unknown_symptom",
+        "message": "I feel a strange buzzing in my elbow when I snap my fingers."
+    }
+    response = client.post("/api/v1/triage", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["local_triage_used"] is False

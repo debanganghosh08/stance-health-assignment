@@ -174,7 +174,11 @@ class CasesService:
         Executes symptom triage on the loaded dataset, choosing rules or LLM based on confidence.
         """
         import os
+        from app.services.nlp_processor import extract_features
+        from app.services.rule_engine import evaluate_rules
+
         batch_max_llm_cases = int(os.getenv("BATCH_MAX_LLM_CASES", "15"))
+        threshold = float(os.getenv("LOCAL_TRIAGE_CONFIDENCE_THRESHOLD", "0.80"))
 
         cases = await self.fetch_cases()
         total_cases = len(cases)
@@ -187,8 +191,8 @@ class CasesService:
             "self_care": 0
         }
 
-        bypassed_count = 0
-        llm_cases_used = 0
+        local_triage_used_count = 0
+        llm_triage_used_count = 0
 
         for case in cases:
             patient_id = case.get("patient_id")
@@ -198,29 +202,67 @@ class CasesService:
                 logger.warning(f"Skipping malformed case: {case}")
                 continue
 
-            # Check rule engine first
+            # 1. Check existing old rule engine first
             rule_triage = self.evaluate_rules(message, patient_id)
 
+            matched_rule_name = "None"
+            llm_used = False
+
             if rule_triage and rule_triage.confidence >= 0.8:
-                logger.info(f"⚡ [BYPASS] Rule-based match for patient {patient_id} with confidence {rule_triage.confidence}. Skipping LLM.")
+                logger.info(f"⚡ [BYPASS] Old rule match for patient {patient_id} with confidence {rule_triage.confidence}. Skipping LLM.")
                 triage_res = rule_triage
-                bypassed_count += 1
+                triage_res.local_triage_used = True
+                local_triage_used_count += 1
+                matched_rule_name = "Old Rule Engine"
             else:
-                # Rule confidence < 0.8
-                if llm_cases_used < batch_max_llm_cases:
-                    logger.info(f"🧠 [LLM] No rule match for patient {patient_id}. Dispatching to LangGraph LLM. (Used: {llm_cases_used}/{batch_max_llm_cases})")
-                    triage_res = await self.triage_service.triage_symptoms(message, patient_id)
-                    llm_cases_used += 1
-                else:
-                    logger.info(f"⚠️ [BUDGET EXHAUSTED] LLM budget exhausted. Returning fallback response for patient {patient_id}.")
+                # 2. Check new local NLP + rule engine
+                features = extract_features(message)
+                rule_res = evaluate_rules(features)
+
+                if rule_res and rule_res.confidence >= threshold:
+                    logger.info(f"⚡ [BYPASS] New NLP rule match for patient {patient_id} ({rule_res.matched_rule}) with confidence {rule_res.confidence}. Skipping LLM.")
+                    
+                    urg = rule_res.urgency
+                    if urg == "Emergency":
+                        disclaimer = "CRITICAL WARNING: These symptoms are potentially life-threatening. Seek immediate emergency care by calling 911 or visiting the nearest Emergency Room. Do not wait."
+                    elif urg == "Urgent":
+                        disclaimer = "This is a screening triage tool, not a clinical diagnosis. You should contact a doctor or visit an urgent care center within 12-24 hours for evaluation."
+                    elif urg == "Non-Urgent":
+                        disclaimer = "Please schedule an appointment with your primary care provider at your convenience. Seek urgent care if your condition changes or new red flags develop."
+                    else:
+                        disclaimer = "These symptoms appear mild and manageable at home. Rest, stay hydrated, and monitor. If your symptoms worsen or do not improve in a few days, consult a healthcare professional."
+
                     triage_res = TriageResponse(
                         patient_id=patient_id,
-                        urgency=UrgencyLevel.URGENT,
-                        condition="Needs Clinical Review",
-                        red_flags=[],
-                        confidence=0.50,
-                        disclaimer="This is a screening triage tool, not a clinical diagnosis. You should contact a doctor or visit an urgent care center within 12-24 hours for evaluation."
+                        urgency=UrgencyLevel(rule_res.urgency),
+                        condition=rule_res.condition,
+                        red_flags=rule_res.red_flags,
+                        confidence=rule_res.confidence,
+                        disclaimer=disclaimer,
+                        local_triage_used=True
                     )
+                    local_triage_used_count += 1
+                    matched_rule_name = f"NLP Rule: {rule_res.matched_rule}"
+                else:
+                    # 3. Use LLM ONLY while budget allows
+                    if llm_triage_used_count < batch_max_llm_cases:
+                        logger.info(f"🧠 [LLM] Dispatching patient {patient_id} to LangGraph. (Used LLM: {llm_triage_used_count}/{batch_max_llm_cases})")
+                        triage_res = await self.triage_service.triage_symptoms(message, patient_id)
+                        triage_res.local_triage_used = False
+                        llm_triage_used_count += 1
+                        llm_used = True
+                    else:
+                        logger.info(f"⚠️ [BUDGET EXHAUSTED] LLM budget exhausted. Returning fallback response for patient {patient_id}.")
+                        triage_res = TriageResponse(
+                            patient_id=patient_id,
+                            urgency=UrgencyLevel.URGENT,
+                            condition="Needs Clinical Review",
+                            red_flags=[],
+                            confidence=0.50,
+                            disclaimer="This is a screening triage tool, not a clinical diagnosis. You should contact a doctor or visit an urgent care center within 12-24 hours for evaluation.",
+                            local_triage_used=False
+                        )
+                        matched_rule_name = "Fallback (Budget Exhausted)"
 
             # Record result
             results.append(triage_res)
@@ -236,7 +278,20 @@ class CasesService:
             elif urgency == UrgencyLevel.SELF_CARE:
                 metrics["self_care"] += 1
 
-        logger.info(f"Batch processing completed. LLM Bypassed: {bypassed_count}/{total_cases} cases. LLM Used: {llm_cases_used}/{batch_max_llm_cases}.")
+            # Performance Logging
+            logger.info(
+                f"📊 [PERFORMANCE LOG] Patient ID: {patient_id} | "
+                f"Rule Match: {matched_rule_name} | "
+                f"Confidence: {triage_res.confidence:.2f} | "
+                f"LLM Used: {llm_used}"
+            )
+
+        logger.info(
+            f"Batch processing completed. "
+            f"Total: {total_cases} | "
+            f"Local: {local_triage_used_count} | "
+            f"LLM: {llm_triage_used_count}."
+        )
 
         processing_metrics = ProcessingMetrics(
             total_cases=total_cases,
@@ -246,9 +301,10 @@ class CasesService:
             self_care_count=metrics["self_care"]
         )
 
-        groq_calls_used = 2 * llm_cases_used
-        groq_calls_saved = 2 * (total_cases - llm_cases_used)
-        llm_budget_exhausted = llm_cases_used >= batch_max_llm_cases
+        groq_calls_used = 2 * llm_triage_used_count
+        groq_calls_saved = 2 * (total_cases - llm_triage_used_count)
+        llm_budget_exhausted = llm_triage_used_count >= batch_max_llm_cases
+        local_triage_saved_calls = 2 * local_triage_used_count
 
         return BatchTriageResponse(
             total_cases=total_cases,
@@ -257,5 +313,8 @@ class CasesService:
             metrics=processing_metrics,
             groq_calls_used=groq_calls_used,
             groq_calls_saved=groq_calls_saved,
-            llm_budget_exhausted=llm_budget_exhausted
+            llm_budget_exhausted=llm_budget_exhausted,
+            local_triage_used=local_triage_used_count,
+            llm_triage_used=llm_triage_used_count,
+            local_triage_saved_calls=local_triage_saved_calls
         )
