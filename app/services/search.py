@@ -84,3 +84,11 @@ class SearchService:
             )
 
         return "\n\n---\n\n".join(matched_references)
+
+_search_service = None
+
+def get_search_service() -> SearchService:
+    global _search_service
+    if _search_service is None:
+        _search_service = SearchService()
+    return _search_service

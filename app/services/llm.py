@@ -62,9 +62,15 @@ class MockStructuredRunnable:
         # Schema 1: SymptomAnalysis
         if self.schema.__name__ == "SymptomAnalysis":
             is_critical = any(kw in text for kw in [
-                "chest pain", "heart", "stroke", "paralysis", "breathing", 
-                "short of breath", "unconscious", "slurred", "bleeding", "anaphylaxis"
+                "stroke", "paralysis", "unconscious", "slurred", "bleeding", "anaphylaxis", "seizure", "unable to breathe", "loss of consciousness"
             ])
+            # For chest pain and shortness of breath, only critical if accompanied by high-risk symptoms
+            if "chest pain" in text:
+                if any(hr in text for hr in ["sweating", "arm pain", "shortness of breath", "dizziness", "jaw"]):
+                    is_critical = True
+            if "shortness of breath" in text or "short of breath" in text:
+                if any(hr in text for hr in ["chest pain", "dizziness", "blue lips", "confusion"]):
+                    is_critical = True
             
             # Simple keyword extraction for search query
             words = [w for w in text.split() if len(w) > 3 and w not in ["have", "with", "from", "about", "that", "this", "pain"]]
@@ -88,10 +94,17 @@ class MockStructuredRunnable:
                     pass
             
             is_critical = "acute emergency suspected? yes" in text or any(kw in symptoms_text for kw in [
-                "chest pain", "heart attack", "stroke", "short of breath", "anaphylaxis"
+                "stroke", "anaphylaxis", "seizure", "unable to breathe", "loss of consciousness"
             ])
+            if "chest pain" in symptoms_text:
+                if any(hr in symptoms_text for hr in ["sweating", "arm pain", "shortness of breath", "dizziness", "jaw"]):
+                    is_critical = True
+            if "shortness of breath" in symptoms_text or "short of breath" in symptoms_text:
+                if any(hr in symptoms_text for hr in ["chest pain", "dizziness", "blue lips", "confusion"]):
+                    is_critical = True
+
             is_urgent = any(kw in symptoms_text for kw in [
-                "fever", "abdominal", "stomach", "vomit", "infection", "fracture", "severe pain"
+                "fever", "abdominal", "stomach", "vomit", "infection", "fracture", "severe pain", "chest pain", "shortness of breath", "short of breath"
             ])
             
             if is_critical:

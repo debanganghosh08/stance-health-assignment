@@ -27,6 +27,18 @@ class TriageService:
             # Run the compiled StateGraph workflow asynchronously
             final_state = await triage_graph.ainvoke(initial_state)
             
+            # Print Triage Engine diagnostics logs (Task 7)
+            local_bypass = final_state.get("local_triage_used", False)
+            rag_used = final_state.get("rag_used", False)
+            llm_used = not local_bypass
+            
+            print("\n" + "="*50)
+            print("[TRIAGE ENGINE]")
+            print(f"Local Bypass: {'Yes' if local_bypass else 'No'}")
+            print(f"LLM Used: {'Yes' if llm_used else 'No'}")
+            print(f"RAG Used: {'Yes' if rag_used else 'No'}")
+            print("="*50 + "\n")
+            
             # Retrieve the structured response from state
             triage_response: Optional[TriageResponse] = final_state.get("triage_response")
             

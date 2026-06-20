@@ -56,6 +56,14 @@ class TriageResponse(TriageAssessment):
         description="Unique identifier for the patient matching the request."
     )
     local_triage_used: Optional[bool] = None
+    sources: Optional[List[dict]] = None
+    rag_used: Optional[bool] = False
+    retrieval_latency_ms: Optional[int] = 0
+    retrieved_chunks: Optional[int] = 0
+    escalation_reason: Optional[str] = Field(
+        None,
+        description="Reason for clinical triage escalation or safety check outcome, if applicable."
+    )
 
 
 class SymptomAnalysis(BaseModel):
@@ -81,6 +89,13 @@ class TriageState(TypedDict):
     errors: List[str]
     features: Optional[Any]
     local_triage_used: Optional[bool]
+    retrieved_context: Optional[str]
+    sources: Optional[List[dict]]
+    rag_used: Optional[bool]
+    retrieval_latency_ms: Optional[int]
+    retrieved_chunks: Optional[int]
+    escalation_reason: Optional[str]
+    trace_id: Optional[str]
 
 
 class ProcessingMetrics(BaseModel):

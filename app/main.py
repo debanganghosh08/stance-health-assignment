@@ -52,12 +52,22 @@ async def lifespan(app: FastAPI):
         api_key == "mock"
     )
 
+    # Pre-initialize FAISS RAG retriever
+    try:
+        from app.services.rag import get_retriever
+        logger.info("📂 Lifespan startup: Pre-initializing RAG retriever index...")
+        get_retriever()
+        logger.info("📂 Lifespan startup: RAG retriever index ready.")
+    except Exception as startup_err:
+        logger.error(f"❌ Failed to initialize RAG retriever on startup: {startup_err}", exc_info=True)
+
     logger.info("=========================================")
     logger.info("🚀 Symptom Triage Agent App Initializing")
     logger.info(f"🤖 Configured LLM Model: {model}")
     logger.info(f"🔑 Mock LLM Mode: {'ACTIVE (Offline Sandbox)' if is_mock else 'INACTIVE (Live Groq)'}")
     logger.info("=========================================")
     yield
+
 
 # Instantiate FastAPI application with lifespan context manager
 app = FastAPI(
