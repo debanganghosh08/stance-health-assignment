@@ -174,9 +174,11 @@ class CasesService:
         Executes symptom triage on the loaded dataset, choosing rules or LLM based on confidence.
         """
         import os
+        import time
         from app.services.nlp_processor import extract_features
         from app.services.rule_engine import evaluate_rules
 
+        batch_start_time = time.time()
         batch_max_llm_cases = int(os.getenv("BATCH_MAX_LLM_CASES", "15"))
         threshold = float(os.getenv("LOCAL_TRIAGE_CONFIDENCE_THRESHOLD", "0.80"))
 
@@ -193,8 +195,12 @@ class CasesService:
 
         local_triage_used_count = 0
         llm_triage_used_count = 0
+        cache_hits_count = 0
+        cache_misses_count = 0
+        total_latency = 0.0
 
         for case in cases:
+            case_start = time.time()
             patient_id = case.get("patient_id")
             message = case.get("message")
 
@@ -264,6 +270,17 @@ class CasesService:
                         )
                         matched_rule_name = "Fallback (Budget Exhausted)"
 
+            # Set performance and cache fields on triage response
+            case_duration = int((time.time() - case_start) * 1000)
+            triage_res.processing_time_ms = max(case_duration, 1)
+            
+            if triage_res.cache_hit:
+                cache_hits_count += 1
+            else:
+                cache_misses_count += 1
+                
+            total_latency += triage_res.processing_time_ms
+
             # Record result
             results.append(triage_res)
 
@@ -283,14 +300,24 @@ class CasesService:
                 f"📊 [PERFORMANCE LOG] Patient ID: {patient_id} | "
                 f"Rule Match: {matched_rule_name} | "
                 f"Confidence: {triage_res.confidence:.2f} | "
-                f"LLM Used: {llm_used}"
+                f"LLM Used: {llm_used} | "
+                f"Cache Hit: {triage_res.cache_hit} ({triage_res.cache_layer}) | "
+                f"Latency: {triage_res.processing_time_ms}ms"
             )
+
+        total_processing_time = int((time.time() - batch_start_time) * 1000)
+        avg_latency = total_latency / len(results) if results else 0.0
+        hit_rate = (cache_hits_count / len(results)) * 100 if results else 0.0
 
         logger.info(
             f"Batch processing completed. "
             f"Total: {total_cases} | "
             f"Local: {local_triage_used_count} | "
-            f"LLM: {llm_triage_used_count}."
+            f"LLM: {llm_triage_used_count} | "
+            f"Hits: {cache_hits_count} | "
+            f"Misses: {cache_misses_count} | "
+            f"Hit Rate: {hit_rate:.2f}% | "
+            f"Avg Latency: {avg_latency:.2f}ms."
         )
 
         processing_metrics = ProcessingMetrics(
@@ -316,5 +343,10 @@ class CasesService:
             llm_budget_exhausted=llm_budget_exhausted,
             local_triage_used=local_triage_used_count,
             llm_triage_used=llm_triage_used_count,
-            local_triage_saved_calls=local_triage_saved_calls
+            local_triage_saved_calls=local_triage_saved_calls,
+            cache_hits=cache_hits_count,
+            cache_misses=cache_misses_count,
+            cache_hit_rate=round(hit_rate, 2),
+            total_processing_time_ms=total_processing_time,
+            avg_latency_ms=round(avg_latency, 2)
         )

@@ -166,11 +166,14 @@ async def analyze_node(state: TriageState) -> dict:
             "message": f"Analysis complete. Is critical: {analysis.is_critical}, Search query: '{analysis.search_query}'"
         })
         
-        return {
+        ret_dict = {
             "is_critical": analysis.is_critical,
             "search_query": analysis.search_query,
             "errors": errors
         }
+        from app.services.llm import llm_cache_hit_var
+        ret_dict["llm_cache_hit"] = llm_cache_hit_var.get()
+        return ret_dict
     except Exception as e:
         logger.error(f"❌ Error in analyze_node: {e}", exc_info=True)
         # Fallback to safe default values to ensure robustness
@@ -206,7 +209,13 @@ async def retrieve_node(state: TriageState) -> dict:
         retriever = get_retriever()
         top_k = int(os.getenv("RAG_TOP_K", "3"))
         
-        res = retriever.retrieve(search_query, top_k=top_k)
+        # Pass the original message for Level 2 (RAG) caching if supported (for mock compatibility in tests)
+        import inspect
+        sig = inspect.signature(retriever.retrieve)
+        if "message" in sig.parameters:
+            res = retriever.retrieve(search_query, top_k=top_k, message=state.get("message"))
+        else:
+            res = retriever.retrieve(search_query, top_k=top_k)
         
         context = res.get("context", "")
         sources = res.get("sources", [])
@@ -216,7 +225,12 @@ async def retrieve_node(state: TriageState) -> dict:
         context_capped = context[:2000]
         
         retrieved_chunks = len(sources)
-        return {
+        
+        # Check cache hit status
+        from app.services.rag import rag_cache_hit_var
+        is_hit = rag_cache_hit_var.get()
+        
+        ret_dict = {
             "retrieved_context": context_capped,
             "sources": sources,
             "rag_used": retrieved_chunks > 0,
@@ -224,6 +238,10 @@ async def retrieve_node(state: TriageState) -> dict:
             "retrieved_chunks": retrieved_chunks,
             "errors": errors
         }
+        
+        ret_dict["rag_cache_hit"] = is_hit
+        return ret_dict
+        
     except Exception as e:
         logger.error(f"❌ Error in retrieve_node: {e}", exc_info=True)
         return {
@@ -234,6 +252,7 @@ async def retrieve_node(state: TriageState) -> dict:
             "retrieved_chunks": 0,
             "errors": errors + [f"retrieve_node error: {str(e)}"]
         }
+
 
 async def search_node(state: TriageState) -> dict:
     """
@@ -334,10 +353,13 @@ async def triage_node(state: TriageState) -> dict:
         
         logger.info(f"Triage complete. Level: {triage_response.urgency.value}, Suspected condition: {triage_response.condition}")
         
-        return {
+        ret_dict = {
             "triage_response": triage_response,
             "errors": errors
         }
+        from app.services.llm import llm_cache_hit_var
+        ret_dict["llm_cache_hit"] = llm_cache_hit_var.get() or state.get("llm_cache_hit", False)
+        return ret_dict
     except Exception as e:
         logger.error(f"❌ Error in triage_node: {e}", exc_info=True)
         
@@ -660,7 +682,25 @@ async def validator_node(state: TriageState) -> dict:
         "calibrated_confidence": triage_response.confidence
     })
 
-    return {"triage_response": triage_response}
+    llm_hit = bool(state.get("llm_cache_hit"))
+    rag_hit = bool(state.get("rag_cache_hit"))
+    
+    if llm_hit:
+        triage_response.cache_hit = True
+        triage_response.cache_layer = "llm"
+    elif rag_hit:
+        triage_response.cache_hit = True
+        triage_response.cache_layer = "rag"
+    else:
+        triage_response.cache_hit = False
+        triage_response.cache_layer = None
+
+    return {
+        "triage_response": triage_response,
+        "cache_hit": triage_response.cache_hit,
+        "cache_layer": triage_response.cache_layer
+    }
+
 
 # Construct the StateGraph
 workflow = StateGraph(TriageState)

@@ -10,7 +10,35 @@ class TriageService:
     Orchestrates the symptom triage process by invoking the compiled LangGraph workflow.
     """
     async def triage_symptoms(self, message: str, patient_id: str) -> TriageResponse:
+        import time
+        from app.services.cache import get_normalized_hash, cache_service
+        
         logger.info(f"TriageService starting triage workflow for patient '{patient_id}': '{message[:60]}...'")
+        
+        start_time = time.time()
+        
+        # Calculate Level 1 cache key
+        h = get_normalized_hash(message)
+        cache_key = f"triage:{h}"
+        
+        # Check Level 1 Cache (Full Response Cache)
+        cached_res = cache_service.get(cache_key)
+        if cached_res is not None:
+            try:
+                triage_response = TriageResponse.model_validate(cached_res)
+                triage_response.patient_id = patient_id
+                triage_response.cache_hit = True
+                triage_response.cache_layer = "triage_response"
+                
+                delta_ms = int((time.time() - start_time) * 1000)
+                triage_response.processing_time_ms = max(delta_ms, 0)
+                
+                print(f"[CACHE]\nLayer: triage_response\nKey: {cache_key}\nHit: True")
+                print(f"[PERFORMANCE]\nProcessing Time: {triage_response.processing_time_ms}ms")
+                
+                return triage_response
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to parse cached triage response: {e}. Re-executing pipeline.")
         
         # Initialize the LangGraph State Dict
         initial_state: TriageState = {
@@ -20,7 +48,11 @@ class TriageService:
             "search_query": None,
             "search_results": None,
             "triage_response": None,
-            "errors": []
+            "errors": [],
+            "cache_hit": False,
+            "cache_layer": None,
+            "llm_cache_hit": False,
+            "rag_cache_hit": False
         }
         
         try:
@@ -49,9 +81,28 @@ class TriageService:
             
             if not triage_response:
                 raise RuntimeError("Symptoms triage graph execution completed but failed to yield a triage response.")
+            
+            # Calculate processing metrics
+            delta_ms = int((time.time() - start_time) * 1000)
+            triage_response.processing_time_ms = max(delta_ms, 1)
+            
+            # Copy cache status from graph execution state (if any inner cache was hit)
+            triage_response.cache_hit = final_state.get("cache_hit", False) or False
+            triage_response.cache_layer = final_state.get("cache_layer")
+            
+            # Conditional Caching Constraint: Cache only if RAG was used or LLM was used (local_triage_used is False)
+            expensive = triage_response.rag_used or (not triage_response.local_triage_used)
+            if expensive:
+                cache_service.set(cache_key, triage_response.model_dump())
+                print(f"[CACHE]\nLayer: triage_response\nKey: {cache_key}\nHit: False")
+            else:
+                logger.info(f"ℹ️ Request is not expensive (local rules match, no RAG/LLM). Skipping cache storage.")
                 
+            print(f"[PERFORMANCE]\nProcessing Time: {triage_response.processing_time_ms}ms")
+            
             return triage_response
             
         except Exception as e:
             logger.error(f"❌ Critical exception inside TriageService: {e}", exc_info=True)
             raise e
+

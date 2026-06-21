@@ -64,6 +64,9 @@ class TriageResponse(TriageAssessment):
         None,
         description="Reason for clinical triage escalation or safety check outcome, if applicable."
     )
+    cache_hit: bool = False
+    cache_layer: Optional[str] = None
+    processing_time_ms: int = 0
 
 
 class SymptomAnalysis(BaseModel):
@@ -96,6 +99,11 @@ class TriageState(TypedDict):
     retrieved_chunks: Optional[int]
     escalation_reason: Optional[str]
     trace_id: Optional[str]
+    cache_hit: Optional[bool]
+    cache_layer: Optional[str]
+    processing_time_ms: Optional[int]
+    llm_cache_hit: Optional[bool]
+    rag_cache_hit: Optional[bool]
 
 
 class ProcessingMetrics(BaseModel):
@@ -116,5 +124,10 @@ class BatchTriageResponse(BaseModel):
     local_triage_used: Optional[int] = None
     llm_triage_used: Optional[int] = None
     local_triage_saved_calls: Optional[int] = None
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_hit_rate: float = 0.0
+    total_processing_time_ms: int = 0
+    avg_latency_ms: float = 0.0
 
 

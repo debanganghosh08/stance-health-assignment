@@ -11,3 +11,4 @@ faiss-cpu>=1.7.4
 pypdf>=3.9.0
 sentence-transformers>=2.2.2
 langchain-huggingface
+redis>=5.0.0

@@ -1,8 +1,12 @@
 import os
 import logging
-from typing import Any, Dict, List, Type, Union
+import contextvars
+from typing import Any, Dict, List, Type, Union, Optional
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+# Context variable to track LLM cache hit status across graph execution
+llm_cache_hit_var = contextvars.ContextVar("llm_cache_hit", default=False)
 
 # Set up logging
 logger = logging.getLogger("app.services.llm")
@@ -20,6 +24,85 @@ try:
     GROQ_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"⚠️ Groq dependencies are missing ({e}). App will run in MockLLM fallback mode.")
+
+def extract_original_message(input_messages: Any) -> str:
+    """
+    Extracts the original raw patient symptom message from input prompts.
+    Handles both analyze_node messages and triage_node messages.
+    """
+    text = ""
+    if isinstance(input_messages, str):
+        text = input_messages
+    elif isinstance(input_messages, list):
+        for msg in input_messages:
+            # We look for user/human messages
+            if hasattr(msg, "type") and msg.type == "human":
+                text = str(msg.content)
+                break
+            elif isinstance(msg, dict) and msg.get("role") == "user":
+                text = str(msg.get("content", ""))
+                break
+    elif hasattr(input_messages, "content"):
+        text = str(input_messages.content)
+        
+    if not text:
+        return ""
+
+    # Check for analyze_node format
+    # "Analyze the following symptoms:\n{message}"
+    text_lower = text.lower()
+    if "analyze the following symptoms:" in text_lower:
+        parts = text.split("Analyze the following symptoms:\n")
+        if len(parts) > 1:
+            return parts[1].strip()
+        parts_nl = text.split("analyze the following symptoms:")
+        if len(parts_nl) > 1:
+            return parts_nl[1].strip()
+
+    # Check for triage_node format
+    # "PATIENT REPORTED SYMPTOMS:\n{message}\n\n..."
+    if "patient reported symptoms:" in text_lower:
+        try:
+            # Split by PATIENT REPORTED SYMPTOMS:\n
+            subparts = text.split("PATIENT REPORTED SYMPTOMS:\n")
+            if len(subparts) > 1:
+                # split by next heading
+                return subparts[1].split("\n\nEMERGENCY CLASSIFICATION:")[0].strip()
+        except Exception:
+            pass
+
+    return text.strip()
+
+
+def check_llm_cache(schema: Type[BaseModel], input_messages: Any) -> Optional[BaseModel]:
+    original_msg = extract_original_message(input_messages)
+    if not original_msg:
+        return None
+    from app.services.cache import get_normalized_hash, cache_service
+    h = get_normalized_hash(original_msg)
+    cache_key = f"llm:{h}"
+    cached_dict = cache_service.get(cache_key)
+    if isinstance(cached_dict, dict) and schema.__name__ in cached_dict:
+        print(f"[CACHE]\nLayer: llm\nKey: {cache_key}\nHit: True")
+        llm_cache_hit_var.set(True)
+        return schema.model_validate(cached_dict[schema.__name__])
+    return None
+
+
+def save_llm_cache(schema: Type[BaseModel], input_messages: Any, output: BaseModel) -> None:
+    original_msg = extract_original_message(input_messages)
+    if not original_msg:
+        return
+    from app.services.cache import get_normalized_hash, cache_service
+    h = get_normalized_hash(original_msg)
+    cache_key = f"llm:{h}"
+    cached_dict = cache_service.get(cache_key) or {}
+    if not isinstance(cached_dict, dict):
+        cached_dict = {}
+    cached_dict[schema.__name__] = output.model_dump()
+    cache_service.set(cache_key, cached_dict)
+    print(f"[CACHE]\nLayer: llm\nKey: {cache_key}\nHit: False")
+
 
 class MockStructuredRunnable:
     """
@@ -55,7 +138,7 @@ class MockStructuredRunnable:
             return str(input_messages.content)
         return str(input_messages)
 
-    def invoke(self, input_messages: Any, config: Any = None) -> BaseModel:
+    def _invoke_raw(self, input_messages: Any) -> BaseModel:
         text = self._extract_text(input_messages).lower()
         logger.info(f"[MOCK LLM] Simulating response for schema: {self.schema.__name__}")
 
@@ -162,9 +245,18 @@ class MockStructuredRunnable:
         # Fallback for any other schema
         return self.schema()
 
+    def invoke(self, input_messages: Any, config: Any = None) -> BaseModel:
+        cached_val = check_llm_cache(self.schema, input_messages)
+        if cached_val is not None:
+            return cached_val
+        llm_cache_hit_var.set(False)
+        res = self._invoke_raw(input_messages)
+        save_llm_cache(self.schema, input_messages, res)
+        return res
     async def ainvoke(self, input_messages: Any, config: Any = None) -> BaseModel:
-        """Async variant of invoke to satisfy LangGraph's async execution path."""
+        # Call self.invoke to ensure any monkeypatching of invoke in unit tests is respected
         return self.invoke(input_messages, config)
+
 
 class MockLLM:
     """
@@ -178,20 +270,35 @@ class ThrottledStructuredRunnable:
     Wraps a structured runnable (e.g. ChatGroq.with_structured_output())
     and throttles execution by sleeping 1 second before calling the API.
     """
-    def __init__(self, original_runnable: Any):
+    def __init__(self, original_runnable: Any, schema: Type[BaseModel]):
         self.original_runnable = original_runnable
+        self.schema = schema
 
     async def ainvoke(self, input_messages: Any, config: Any = None) -> BaseModel:
+        cached_val = check_llm_cache(self.schema, input_messages)
+        if cached_val is not None:
+            return cached_val
+        
+        llm_cache_hit_var.set(False)
         import asyncio
         logger.info("Throttling Groq request: sleeping 1 second before ainvoke...")
         await asyncio.sleep(1)
-        return await self.original_runnable.ainvoke(input_messages, config)
+        res = await self.original_runnable.ainvoke(input_messages, config)
+        save_llm_cache(self.schema, input_messages, res)
+        return res
 
     def invoke(self, input_messages: Any, config: Any = None) -> BaseModel:
+        cached_val = check_llm_cache(self.schema, input_messages)
+        if cached_val is not None:
+            return cached_val
+        
+        llm_cache_hit_var.set(False)
         import time
         logger.info("Throttling Groq request: sleeping 1 second before invoke...")
         time.sleep(1)
-        return self.original_runnable.invoke(input_messages, config)
+        res = self.original_runnable.invoke(input_messages, config)
+        save_llm_cache(self.schema, input_messages, res)
+        return res
 
 class ThrottledChatGroq:
     """
@@ -203,7 +310,8 @@ class ThrottledChatGroq:
 
     def with_structured_output(self, schema: Type[BaseModel]) -> ThrottledStructuredRunnable:
         original_runnable = self.client.with_structured_output(schema)
-        return ThrottledStructuredRunnable(original_runnable)
+        return ThrottledStructuredRunnable(original_runnable, schema)
+
 
 _llm_instance = None
 

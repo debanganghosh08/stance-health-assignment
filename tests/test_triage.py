@@ -14,6 +14,12 @@ from app.models.schemas import UrgencyLevel
 
 client = TestClient(app)
 
+@pytest.fixture(autouse=True)
+def clear_cache():
+    from app.services.cache import cache_service
+    cache_service.clear()
+
+
 def test_health_check():
     """
     Verifies that the /health endpoint is active and returns status.

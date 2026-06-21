@@ -2,9 +2,13 @@ import os
 import time
 import glob
 import logging
-from typing import Dict, Any, List
+import contextvars
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("app.services.rag")
+
+# Context variable to track RAG cache hit status across graph execution
+rag_cache_hit_var = contextvars.ContextVar("rag_cache_hit", default=False)
 
 CLINICAL_ROUTING_MAP = {
     "pregnancy": ["pregnancy"],
@@ -241,7 +245,7 @@ class FAISSRetriever(BaseRetriever):
                 "document_type": "miscellaneous"
             }]
 
-    def retrieve(self, query: str, top_k: int = 3) -> Dict[str, Any]:
+    def retrieve(self, query: str, top_k: int = 3, message: Optional[str] = None) -> Dict[str, Any]:
         """
         Queries the retriever for relevant clinical guidelines.
         Returns context content, sources list (with score/page/document_type), and latency metrics.
@@ -253,6 +257,19 @@ class FAISSRetriever(BaseRetriever):
                 "sources": [],
                 "retrieval_latency_ms": 0
             }
+
+        # Check Cache Level 2 (RAG Cache)
+        if message:
+            from app.services.cache import get_normalized_hash, cache_service
+            h = get_normalized_hash(message)
+            cache_key = f"rag:{h}"
+            cached = cache_service.get(cache_key)
+            if cached is not None:
+                print(f"[CACHE]\nLayer: rag\nKey: {cache_key}\nHit: True")
+                rag_cache_hit_var.set(True)
+                return cached
+
+        rag_cache_hit_var.set(False)
 
         # Mock Mode Search
         if os.getenv("GROQ_API_KEY") == "mock" or self.index is None:
@@ -271,148 +288,161 @@ class FAISSRetriever(BaseRetriever):
             for src in results["sources"]:
                 diagnostics_lines.append(f"- {src['source']} ({src['score']})")
             logger.info("\n".join(diagnostics_lines))
-            return results
+        else:
+            # Live Mode Search
+            try:
+                INITIAL_RETRIEVAL_K = 8
+                FINAL_TOP_K = top_k
+                MIN_RELEVANCE_SCORE = 0.25
+                RELAXED_MIN_RELEVANCE = 0.20
+                
+                docs_and_scores = self.index.similarity_search_with_relevance_scores(query, k=INITIAL_RETRIEVAL_K)
+                
+                candidates = []
+                for doc, score in docs_and_scores:
+                    raw_score = float(score)
+                    page_num = doc.metadata.get("page", 1)
+                    doc_type = doc.metadata.get("document_type")
+                    if doc_type is None:
+                        doc_type = "miscellaneous"
+                        if isinstance(page_num, int):
+                            page_num = page_num + 1
+                    
+                    pdf_name = os.path.basename(doc.metadata.get("source", "unknown_doc.pdf"))
+                    if doc_type in ["cases", "case"] or pdf_name == "api_cases.pdf":
+                        doc_type = "case"
+     
+                    # Calculate explicit hybrid score (Fix 4)
+                    kw_score = calculate_keyword_score(doc.page_content, pdf_name, query)
+                    hybrid_score = 0.7 * raw_score + 0.3 * kw_score
 
-        # Live Mode Search
-        try:
-            INITIAL_RETRIEVAL_K = 8
-            FINAL_TOP_K = top_k
-            MIN_RELEVANCE_SCORE = 0.25
-            RELAXED_MIN_RELEVANCE = 0.20
-            
-            docs_and_scores = self.index.similarity_search_with_relevance_scores(query, k=INITIAL_RETRIEVAL_K)
-            
-            candidates = []
-            for doc, score in docs_and_scores:
-                raw_score = float(score)
-                page_num = doc.metadata.get("page", 1)
-                doc_type = doc.metadata.get("document_type")
-                if doc_type is None:
-                    doc_type = "miscellaneous"
-                    if isinstance(page_num, int):
-                        page_num = page_num + 1
+                    adjusted_score = hybrid_score
+                    if doc_type in ["emergency", "chronic", "pregnancy", "pediatrics", "miscellaneous"] or doc_type != "case":
+                        adjusted_score *= 1.15
+                    elif doc_type == "case":
+                        adjusted_score *= 0.90
+                    
+                    # Clinical Corpus-Aware Boost (Task 6)
+                    corpus_boost = 1.0
+                    query_lower = query.lower()
+                    for keyword, target_types in CLINICAL_ROUTING_MAP.items():
+                        if keyword in query_lower:
+                            if doc_type in target_types or any(t in pdf_name.lower() for t in target_types):
+                                corpus_boost = 1.20
+                                break
+                    adjusted_score *= corpus_boost
+                    
+                    # Keyword reranking bonus (Task 3)
+                    symptom_phrases = ["back pain", "stroke", "uti", "asthma", "pregnancy", "fever", "headache"]
+                    query_lower = query.lower()
+                    bonus = 0.0
+                    for phrase in symptom_phrases:
+                        if phrase in query_lower:
+                            chunk_text_lower = doc.page_content.lower().replace("-", " ")
+                            filename_lower = pdf_name.lower().replace("-", " ")
+                            if phrase in filename_lower:
+                                bonus = 0.15
+                                break
+                            elif phrase in chunk_text_lower:
+                                bonus = 0.10
+                                break
+                    adjusted_score += bonus
+                    adjusted_score = min(adjusted_score, 1.0)
+                    
+                    adjusted_score_rounded = round(adjusted_score, 2)
+                    
+                    candidates.append({
+                        "context": doc.page_content,
+                        "pdf_name": pdf_name,
+                        "page_num": page_num,
+                        "document_type": doc_type,
+                        "score": adjusted_score_rounded
+                    })
                 
-                pdf_name = os.path.basename(doc.metadata.get("source", "unknown_doc.pdf"))
-                if doc_type in ["cases", "case"] or pdf_name == "api_cases.pdf":
-                    doc_type = "case"
- 
-                # Calculate explicit hybrid score (Fix 4)
-                kw_score = calculate_keyword_score(doc.page_content, pdf_name, query)
-                hybrid_score = 0.7 * raw_score + 0.3 * kw_score
-
-                adjusted_score = hybrid_score
-                if doc_type in ["emergency", "chronic", "pregnancy", "pediatrics", "miscellaneous"] or doc_type != "case":
-                    adjusted_score *= 1.15
-                elif doc_type == "case":
-                    adjusted_score *= 0.90
+                # Apply threshold filtering (first 0.25, fallback to 0.15 if 0 remain)
+                filtered_candidates = [c for c in candidates if c["score"] >= MIN_RELEVANCE_SCORE]
+                if not filtered_candidates:
+                    filtered_candidates = [c for c in candidates if c["score"] >= RELAXED_MIN_RELEVANCE]
                 
-                # Clinical Corpus-Aware Boost (Task 6)
-                corpus_boost = 1.0
-                query_lower = query.lower()
-                for keyword, target_types in CLINICAL_ROUTING_MAP.items():
-                    if keyword in query_lower:
-                        if doc_type in target_types or any(t in pdf_name.lower() for t in target_types):
-                            corpus_boost = 1.20
-                            break
-                adjusted_score *= corpus_boost
+                # Sort by adjusted score descending first to prioritize higher scoring duplicates
+                filtered_candidates.sort(key=lambda x: x["score"], reverse=True)
                 
-                # Keyword reranking bonus (Task 3)
-                symptom_phrases = ["back pain", "stroke", "uti", "asthma", "pregnancy", "fever", "headache"]
-                query_lower = query.lower()
-                bonus = 0.0
-                for phrase in symptom_phrases:
-                    if phrase in query_lower:
-                        chunk_text_lower = doc.page_content.lower().replace("-", " ")
-                        filename_lower = pdf_name.lower().replace("-", " ")
-                        if phrase in filename_lower:
-                            bonus = 0.15
-                            break
-                        elif phrase in chunk_text_lower:
-                            bonus = 0.10
-                            break
-                adjusted_score += bonus
-                adjusted_score = min(adjusted_score, 1.0)
+                # Deduplicate by (source, page) (Task 1)
+                seen = set()
+                deduped_candidates = []
+                for candidate in filtered_candidates:
+                    key = (candidate["pdf_name"], candidate["page_num"])
+                    if key not in seen:
+                        seen.add(key)
+                        deduped_candidates.append(candidate)
                 
-                adjusted_score_rounded = round(adjusted_score, 2)
+                # Cap to FINAL_TOP_K
+                final_candidates = deduped_candidates[:FINAL_TOP_K]
                 
-                candidates.append({
-                    "context": doc.page_content,
-                    "pdf_name": pdf_name,
-                    "page_num": page_num,
-                    "document_type": doc_type,
-                    "score": adjusted_score_rounded
-                })
-            
-            # Apply threshold filtering (first 0.25, fallback to 0.15 if 0 remain)
-            filtered_candidates = [c for c in candidates if c["score"] >= MIN_RELEVANCE_SCORE]
-            if not filtered_candidates:
-                filtered_candidates = [c for c in candidates if c["score"] >= RELAXED_MIN_RELEVANCE]
-            
-            # Sort by adjusted score descending first to prioritize higher scoring duplicates
-            filtered_candidates.sort(key=lambda x: x["score"], reverse=True)
-            
-            # Deduplicate by (source, page) (Task 1)
-            seen = set()
-            deduped_candidates = []
-            for candidate in filtered_candidates:
-                key = (candidate["pdf_name"], candidate["page_num"])
-                if key not in seen:
-                    seen.add(key)
-                    deduped_candidates.append(candidate)
-            
-            # Cap to FINAL_TOP_K
-            final_candidates = deduped_candidates[:FINAL_TOP_K]
-            
-            context_parts = [c["context"] for c in final_candidates]
-            sources = [
-                {
-                    "source": c["pdf_name"],
-                    "page": c["page_num"],
-                    "document_type": c["document_type"],
-                    "score": c["score"]
+                context_parts = [c["context"] for c in final_candidates]
+                sources = [
+                    {
+                        "source": c["pdf_name"],
+                        "page": c["page_num"],
+                        "document_type": c["document_type"],
+                        "score": c["score"]
+                    }
+                    for c in final_candidates
+                ]
+                
+                latency = int((time.time() - t0) * 1000)
+                
+                # Diagnostics logging block
+                diagnostics_lines = [
+                    "[RAG DIAGNOSTICS]",
+                    f"Query: {query}",
+                    f"Retrieved Chunks: {len(sources)}",
+                    f"Latency: {latency} ms",
+                    "Top Sources:"
+                ]
+                for src in sources:
+                    diagnostics_lines.append(f"- {src['source']} ({src['score']})")
+                logger.info("\n".join(diagnostics_lines))
+                
+                results = {
+                    "context": "\n\n---\n\n".join(context_parts),
+                    "sources": sources,
+                    "retrieval_latency_ms": latency
                 }
-                for c in final_candidates
-            ]
+            except Exception as e:
+                logger.error(f"❌ RAG live retrieval failed: {e}", exc_info=True)
+                # Fallback to mock search
+                results = self._retrieve_mock(query, top_k)
+                latency = int((time.time() - t0) * 1000)
+                results["retrieval_latency_ms"] = latency
+                
+                # Diagnostics logging block for fallback
+                diagnostics_lines = [
+                    "[RAG DIAGNOSTICS]",
+                    f"Query: {query}",
+                    f"Retrieved Chunks: {len(results['sources'])}",
+                    f"Latency: {latency} ms",
+                    "Top Sources:"
+                ]
+                for src in results["sources"]:
+                    diagnostics_lines.append(f"- {src['source']} ({src['score']})")
+                logger.info("\n".join(diagnostics_lines))
+
+        # Cache results if message provided and RAG is used (retrieved_chunks > 0)
+        if message:
+            from app.services.cache import get_normalized_hash, cache_service
+            h = get_normalized_hash(message)
+            cache_key = f"rag:{h}"
             
-            latency = int((time.time() - t0) * 1000)
+            # Check if sources are retrieved (meaning RAG was used)
+            sources = results.get("sources", [])
+            if len(sources) > 0:
+                cache_service.set(cache_key, results)
             
-            # Diagnostics logging block
-            diagnostics_lines = [
-                "[RAG DIAGNOSTICS]",
-                f"Query: {query}",
-                f"Retrieved Chunks: {len(sources)}",
-                f"Latency: {latency} ms",
-                "Top Sources:"
-            ]
-            for src in sources:
-                diagnostics_lines.append(f"- {src['source']} ({src['score']})")
-            logger.info("\n".join(diagnostics_lines))
-            
-            return {
-                "context": "\n\n---\n\n".join(context_parts),
-                "sources": sources,
-                "retrieval_latency_ms": latency
-            }
-        except Exception as e:
-            logger.error(f"❌ RAG live retrieval failed: {e}", exc_info=True)
-            # Fallback to mock search
-            results = self._retrieve_mock(query, top_k)
-            latency = int((time.time() - t0) * 1000)
-            results["retrieval_latency_ms"] = latency
-            
-            # Diagnostics logging block for fallback
-            diagnostics_lines = [
-                "[RAG DIAGNOSTICS]",
-                f"Query: {query}",
-                f"Retrieved Chunks: {len(results['sources'])}",
-                f"Latency: {latency} ms",
-                "Top Sources:"
-            ]
-            for src in results["sources"]:
-                diagnostics_lines.append(f"- {src['source']} ({src['score']})")
-            logger.info("\n".join(diagnostics_lines))
-            
-            return results
+            # Log cache event
+            print(f"[CACHE]\nLayer: rag\nKey: {cache_key}\nHit: False")
+
+        return results
 
     def _retrieve_mock(self, query: str, top_k: int) -> Dict[str, Any]:
         """Performs a hybrid keyword + simulated vector overlap query over the local chunk cache."""
