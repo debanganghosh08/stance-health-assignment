@@ -83,7 +83,7 @@ def check_llm_cache(schema: Type[BaseModel], input_messages: Any) -> Optional[Ba
     cache_key = f"llm:{h}"
     cached_dict = cache_service.get(cache_key)
     if isinstance(cached_dict, dict) and schema.__name__ in cached_dict:
-        print(f"[CACHE]\nLayer: llm\nKey: {cache_key}\nHit: True")
+        logger.info(f"CACHE: Layer: llm | Key: {cache_key} | Hit: True")
         llm_cache_hit_var.set(True)
         return schema.model_validate(cached_dict[schema.__name__])
     return None
@@ -94,6 +94,7 @@ def save_llm_cache(schema: Type[BaseModel], input_messages: Any, output: BaseMod
     if not original_msg:
         return
     from app.services.cache import get_normalized_hash, cache_service
+    from app.services.metrics import metrics_registry
     h = get_normalized_hash(original_msg)
     cache_key = f"llm:{h}"
     cached_dict = cache_service.get(cache_key) or {}
@@ -101,7 +102,8 @@ def save_llm_cache(schema: Type[BaseModel], input_messages: Any, output: BaseMod
         cached_dict = {}
     cached_dict[schema.__name__] = output.model_dump()
     cache_service.set(cache_key, cached_dict)
-    print(f"[CACHE]\nLayer: llm\nKey: {cache_key}\nHit: False")
+    logger.info(f"CACHE: Layer: llm | Key: {cache_key} | Hit: False")
+    metrics_registry.increment("llm_calls")
 
 
 class MockStructuredRunnable:

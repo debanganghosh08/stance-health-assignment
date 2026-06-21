@@ -2,6 +2,8 @@ import logging
 from typing import Optional
 from app.graph.triage_graph import triage_graph
 from app.models.schemas import TriageResponse, TriageState
+from app.services.logging import request_id_var, log_audit_event
+from app.services.metrics import metrics_registry
 
 logger = logging.getLogger("app.services.triage")
 
@@ -13,6 +15,7 @@ class TriageService:
         import time
         from app.services.cache import get_normalized_hash, cache_service
         
+        req_id = request_id_var.get("")
         logger.info(f"TriageService starting triage workflow for patient '{patient_id}': '{message[:60]}...'")
         
         start_time = time.time()
@@ -33,8 +36,26 @@ class TriageService:
                 delta_ms = int((time.time() - start_time) * 1000)
                 triage_response.processing_time_ms = max(delta_ms, 0)
                 
-                print(f"[CACHE]\nLayer: triage_response\nKey: {cache_key}\nHit: True")
-                print(f"[PERFORMANCE]\nProcessing Time: {triage_response.processing_time_ms}ms")
+                # Replace prints with logger
+                logger.info(f"CACHE: Layer: triage_response | Key: {cache_key} | Hit: True")
+                logger.info(f"PERFORMANCE: Processing Time: {triage_response.processing_time_ms}ms")
+                
+                # Record metrics
+                metrics_registry.increment("cache_hits")
+                
+                # Secure Clinical Audit completion event
+                log_audit_event(
+                    "triage_completed",
+                    req_id,
+                    patient_id,
+                    {
+                        "urgency": triage_response.urgency.value,
+                        "condition": triage_response.condition,
+                        "override_applied": False,
+                        "cache_layer": "triage_response",
+                        "latency_ms": triage_response.processing_time_ms
+                    }
+                )
                 
                 return triage_response
             except Exception as e:
@@ -52,24 +73,24 @@ class TriageService:
             "cache_hit": False,
             "cache_layer": None,
             "llm_cache_hit": False,
-            "rag_cache_hit": False
+            "rag_cache_hit": False,
+            "trace_id": req_id
         }
         
         try:
             # Run the compiled StateGraph workflow asynchronously
             final_state = await triage_graph.ainvoke(initial_state)
             
-            # Print Triage Engine diagnostics logs (Task 7)
+            # Print Triage Engine diagnostics logs (Task 7) -> Replace prints with logger
             local_bypass = final_state.get("local_triage_used", False)
             rag_used = final_state.get("rag_used", False)
             llm_used = not local_bypass
             
-            print("\n" + "="*50)
-            print("[TRIAGE ENGINE]")
-            print(f"Local Bypass: {'Yes' if local_bypass else 'No'}")
-            print(f"LLM Used: {'Yes' if llm_used else 'No'}")
-            print(f"RAG Used: {'Yes' if rag_used else 'No'}")
-            print("="*50 + "\n")
+            logger.info(
+                f"[TRIAGE ENGINE] Local Bypass: {'Yes' if local_bypass else 'No'} | "
+                f"LLM Used: {'Yes' if llm_used else 'No'} | "
+                f"RAG Used: {'Yes' if rag_used else 'No'}"
+            )
             
             # Retrieve the structured response from state
             triage_response: Optional[TriageResponse] = final_state.get("triage_response")
@@ -94,15 +115,41 @@ class TriageService:
             expensive = triage_response.rag_used or (not triage_response.local_triage_used)
             if expensive:
                 cache_service.set(cache_key, triage_response.model_dump())
-                print(f"[CACHE]\nLayer: triage_response\nKey: {cache_key}\nHit: False")
+                logger.info(f"CACHE: Layer: triage_response | Key: {cache_key} | Hit: False")
             else:
                 logger.info(f"ℹ️ Request is not expensive (local rules match, no RAG/LLM). Skipping cache storage.")
                 
-            print(f"[PERFORMANCE]\nProcessing Time: {triage_response.processing_time_ms}ms")
+            logger.info(f"PERFORMANCE: Processing Time: {triage_response.processing_time_ms}ms")
+            
+            # Record metrics
+            if triage_response.cache_hit:
+                metrics_registry.increment("cache_hits")
+            else:
+                metrics_registry.increment("cache_misses")
+                
+            if local_bypass:
+                metrics_registry.increment("local_bypass_count")
+                
+            from app.models.schemas import UrgencyLevel
+            if triage_response.urgency in (UrgencyLevel.EMERGENCY, UrgencyLevel.CRITICAL):
+                metrics_registry.increment("emergency_cases")
+                
+            # Secure Clinical Audit completion event
+            log_audit_event(
+                "triage_completed",
+                req_id,
+                patient_id,
+                {
+                    "urgency": triage_response.urgency.value,
+                    "condition": triage_response.condition,
+                    "override_applied": final_state.get("override_applied", False) or False,
+                    "cache_layer": triage_response.cache_layer,
+                    "latency_ms": triage_response.processing_time_ms
+                }
+            )
             
             return triage_response
             
         except Exception as e:
             logger.error(f"❌ Critical exception inside TriageService: {e}", exc_info=True)
             raise e
-

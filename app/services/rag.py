@@ -265,7 +265,7 @@ class FAISSRetriever(BaseRetriever):
             cache_key = f"rag:{h}"
             cached = cache_service.get(cache_key)
             if cached is not None:
-                print(f"[CACHE]\nLayer: rag\nKey: {cache_key}\nHit: True")
+                logger.info(f"CACHE: Layer: rag | Key: {cache_key} | Hit: True")
                 rag_cache_hit_var.set(True)
                 return cached
 
@@ -428,6 +428,11 @@ class FAISSRetriever(BaseRetriever):
                     diagnostics_lines.append(f"- {src['source']} ({src['score']})")
                 logger.info("\n".join(diagnostics_lines))
 
+        # Record metrics
+        from app.services.metrics import metrics_registry
+        metrics_registry.increment("rag_calls")
+        metrics_registry.observe_latency("rag_retrieval", results.get("retrieval_latency_ms", 0))
+
         # Cache results if message provided and RAG is used (retrieved_chunks > 0)
         if message:
             from app.services.cache import get_normalized_hash, cache_service
@@ -440,7 +445,7 @@ class FAISSRetriever(BaseRetriever):
                 cache_service.set(cache_key, results)
             
             # Log cache event
-            print(f"[CACHE]\nLayer: rag\nKey: {cache_key}\nHit: False")
+            logger.info(f"CACHE: Layer: rag | Key: {cache_key} | Hit: False")
 
         return results
 

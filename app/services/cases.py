@@ -220,6 +220,13 @@ class CasesService:
                 triage_res.local_triage_used = True
                 local_triage_used_count += 1
                 matched_rule_name = "Old Rule Engine"
+                
+                # Record metrics
+                from app.services.metrics import metrics_registry
+                metrics_registry.increment("local_bypass_count")
+                metrics_registry.increment("cache_misses")
+                if triage_res.urgency in (UrgencyLevel.EMERGENCY, UrgencyLevel.CRITICAL):
+                    metrics_registry.increment("emergency_cases")
             else:
                 # 2. Check new local NLP + rule engine
                 features = extract_features(message)
@@ -249,6 +256,13 @@ class CasesService:
                     )
                     local_triage_used_count += 1
                     matched_rule_name = f"NLP Rule: {rule_res.matched_rule}"
+                    
+                    # Record metrics
+                    from app.services.metrics import metrics_registry
+                    metrics_registry.increment("local_bypass_count")
+                    metrics_registry.increment("cache_misses")
+                    if triage_res.urgency in (UrgencyLevel.EMERGENCY, UrgencyLevel.CRITICAL):
+                        metrics_registry.increment("emergency_cases")
                 else:
                     # 3. Use LLM ONLY while budget allows
                     if llm_triage_used_count < batch_max_llm_cases:
@@ -269,6 +283,10 @@ class CasesService:
                             local_triage_used=False
                         )
                         matched_rule_name = "Fallback (Budget Exhausted)"
+                        
+                        # Record metrics
+                        from app.services.metrics import metrics_registry
+                        metrics_registry.increment("cache_misses")
 
             # Set performance and cache fields on triage response
             case_duration = int((time.time() - case_start) * 1000)

@@ -5,3 +5,5 @@ __pycache__/
 .env.local
 *.pyc
 app/resources/vector_store/
+logs/
+*.log

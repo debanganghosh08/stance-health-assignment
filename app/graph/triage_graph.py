@@ -45,11 +45,18 @@ async def feature_extraction_node(state: TriageState) -> dict:
     """
     Extracts clinical features from patient message locally.
     """
+    import time
+    t0 = time.time()
     import uuid
     trace_id = state.get("trace_id") or str(uuid.uuid4())
     logger.info({"trace_id": trace_id, "node": "feature_extraction_node", "status": "started"})
     message = state.get("message", "")
     features = extract_features(message)
+    
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("feature_extraction", latency)
+    
     return {"features": features, "trace_id": trace_id}
 
 async def rule_engine_node(state: TriageState) -> dict:
@@ -57,6 +64,8 @@ async def rule_engine_node(state: TriageState) -> dict:
     Evaluates extracted symptoms using local rules. If confidence meets the threshold,
     bypasses LLM reasoning and populates the response immediately.
     """
+    import time
+    t0 = time.time()
     trace_id = state.get("trace_id")
     logger.info({"trace_id": trace_id, "node": "rule_engine_node", "status": "started"})
     features = state.get("features")
@@ -64,11 +73,15 @@ async def rule_engine_node(state: TriageState) -> dict:
     patient_id = state.get("patient_id", "unknown")
     
     if not features:
+        latency = (time.time() - t0) * 1000
+        from app.services.metrics import metrics_registry
+        metrics_registry.observe_latency("rule_engine", latency)
         return {"errors": errors + ["No features extracted before rule engine."]}
 
     rule_res = evaluate_rules(features)
     threshold = float(os.getenv("LOCAL_TRIAGE_CONFIDENCE_THRESHOLD", "0.80"))
 
+    res_dict = {"local_triage_used": False}
     if rule_res and rule_res.confidence >= threshold:
         logger.info({
             "trace_id": trace_id,
@@ -100,14 +113,18 @@ async def rule_engine_node(state: TriageState) -> dict:
             retrieved_chunks=0,
             escalation_reason=f"Deterministic rule: {rule_res.matched_rule}"
         )
-        return {
+        res_dict = {
             "triage_response": triage_response,
             "local_triage_used": True,
             "errors": errors
         }
-    
-    logger.info("ℹ️ Local rule engine confidence below threshold. Proceeding to LLM flow.")
-    return {"local_triage_used": False}
+    else:
+        logger.info("ℹ️ Local rule engine confidence below threshold. Proceeding to LLM flow.")
+
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("rule_engine", latency)
+    return res_dict
 
 def local_triage_router(state: TriageState) -> Literal["analyze_node", "__end__"]:
     """
@@ -125,6 +142,8 @@ async def analyze_node(state: TriageState) -> dict:
     Analyzes raw patient symptoms to detect critical life-threatening emergencies
     and formulate a relevant search query for the medical database.
     """
+    import time
+    t0 = time.time()
     trace_id = state.get("trace_id")
     logger.info({"trace_id": trace_id, "node": "analyze_node", "status": "started"})
     message = state.get("message", "")
@@ -140,6 +159,9 @@ async def analyze_node(state: TriageState) -> dict:
             "node": "analyze_node",
             "message": f"🚨 Rule-based check: Emergency detected via keywords {detected_keywords}. Bypassing LLM symptom classification."
         })
+        latency = (time.time() - t0) * 1000
+        from app.services.metrics import metrics_registry
+        metrics_registry.observe_latency("analyze_node", latency)
         return {
             "is_critical": True,
             "search_query": "emergency bypass",
@@ -173,21 +195,27 @@ async def analyze_node(state: TriageState) -> dict:
         }
         from app.services.llm import llm_cache_hit_var
         ret_dict["llm_cache_hit"] = llm_cache_hit_var.get()
-        return ret_dict
     except Exception as e:
         logger.error(f"❌ Error in analyze_node: {e}", exc_info=True)
         # Fallback to safe default values to ensure robustness
-        return {
+        ret_dict = {
             "is_critical": False,
             "search_query": message[:50],  # Fallback search query is first 50 chars of symptoms message
             "errors": errors + [f"analyze_node error: {str(e)}"]
         }
+
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("analyze_node", latency)
+    return ret_dict
 
 async def retrieve_node(state: TriageState) -> dict:
     """
     Queries the local FAISS retriever for medical document context.
     Bypassed on critical emergency.
     """
+    import time
+    t0 = time.time()
     trace_id = state.get("trace_id")
     logger.info({"trace_id": trace_id, "node": "retrieve_node", "status": "started"})
     is_critical = state.get("is_critical", False)
@@ -196,6 +224,9 @@ async def retrieve_node(state: TriageState) -> dict:
     
     if is_critical or not search_query or search_query == "emergency bypass":
         logger.info("🚨 Critical emergency or empty query: Bypassing retrieve_node.")
+        latency = (time.time() - t0) * 1000
+        from app.services.metrics import metrics_registry
+        metrics_registry.observe_latency("rag_retrieval", latency)
         return {
             "retrieved_context": "",
             "sources": [],
@@ -240,11 +271,10 @@ async def retrieve_node(state: TriageState) -> dict:
         }
         
         ret_dict["rag_cache_hit"] = is_hit
-        return ret_dict
         
     except Exception as e:
         logger.error(f"❌ Error in retrieve_node: {e}", exc_info=True)
-        return {
+        ret_dict = {
             "retrieved_context": "",
             "sources": [],
             "rag_used": False,
@@ -252,6 +282,11 @@ async def retrieve_node(state: TriageState) -> dict:
             "retrieved_chunks": 0,
             "errors": errors + [f"retrieve_node error: {str(e)}"]
         }
+
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("rag_retrieval", latency)
+    return ret_dict
 
 
 async def search_node(state: TriageState) -> dict:
@@ -291,6 +326,8 @@ async def triage_node(state: TriageState) -> dict:
     Synthesizes the patient symptoms, medical search context, retrieved context, and emergency status
     to output the final structured triage recommendation.
     """
+    import time
+    t0 = time.time()
     trace_id = state.get("trace_id")
     logger.info({"trace_id": trace_id, "node": "triage_node", "status": "started"})
     message = state.get("message", "")
@@ -359,7 +396,6 @@ async def triage_node(state: TriageState) -> dict:
         }
         from app.services.llm import llm_cache_hit_var
         ret_dict["llm_cache_hit"] = llm_cache_hit_var.get() or state.get("llm_cache_hit", False)
-        return ret_dict
     except Exception as e:
         logger.error(f"❌ Error in triage_node: {e}", exc_info=True)
         
@@ -391,10 +427,15 @@ async def triage_node(state: TriageState) -> dict:
             retrieved_chunks=retrieved_chunks,
             escalation_reason="Fallback due to internal error"
         )
-        return {
+        ret_dict = {
             "triage_response": fallback,
             "errors": errors + [f"triage_node error: {str(e)}"]
         }
+
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("triage_node", latency)
+    return ret_dict
 
 def critical_router(state: TriageState) -> Literal["retrieve_node", "triage_node"]:
     """
@@ -413,6 +454,8 @@ async def validator_node(state: TriageState) -> dict:
     Re-runs feature extraction, detects clinical safety risks, under-triage issues,
     and applies confidence guardrails.
     """
+    import time
+    t0 = time.time()
     trace_id = state.get("trace_id")
     logger.info({"trace_id": trace_id, "node": "validator_node", "status": "started"})
     triage_response_orig = state.get("triage_response")
@@ -682,6 +725,22 @@ async def validator_node(state: TriageState) -> dict:
         "calibrated_confidence": triage_response.confidence
     })
 
+    if override_applied:
+        from app.services.logging import log_audit_event
+        from app.services.metrics import metrics_registry
+        metrics_registry.increment("validator_overrides")
+        log_audit_event(
+            "clinical_override_applied",
+            trace_id,
+            state.get("patient_id", "unknown"),
+            {
+                "original_urgency": original_urgency,
+                "final_urgency": final_urgency,
+                "override_applied": True,
+                "override_reason": risk_str
+            }
+        )
+
     llm_hit = bool(state.get("llm_cache_hit"))
     rag_hit = bool(state.get("rag_cache_hit"))
     
@@ -695,10 +754,15 @@ async def validator_node(state: TriageState) -> dict:
         triage_response.cache_hit = False
         triage_response.cache_layer = None
 
+    latency = (time.time() - t0) * 1000
+    from app.services.metrics import metrics_registry
+    metrics_registry.observe_latency("validator_node", latency)
+
     return {
         "triage_response": triage_response,
         "cache_hit": triage_response.cache_hit,
-        "cache_layer": triage_response.cache_layer
+        "cache_layer": triage_response.cache_layer,
+        "override_applied": override_applied
     }
 
 

@@ -851,21 +851,167 @@ async def test_validator_node_confidence_calibration():
     
     res = await validator_node(state)
     calibrated_response = res["triage_response"]
-    
-    # Trace calculation:
-    # - fever + abdominal pain (stomach pain synonyms map to abdominal pain in nlp_processor)
-    # - rule_res matches (e.g. abdominal pain rule with 0.85 confidence)
-    #   rule_conf = 0.85
-    # - retrieved_chunks is 3
-    #   rag_conf = 3 / 3 = 1.0
-    # - llm_conf = 0.80
-    # - override_applied = True (due to combination rule matching abdominal pain + fever setting override_applied)
-    #   validator_conf = 0.98
-    # Calibrated confidence formula:
-    # final = 0.35 * 0.85 + 0.25 * 1.0 + 0.25 * 0.80 + 0.15 * 0.75
-    # final = 0.2975 + 0.25 + 0.20 + 0.1125 = 0.86
-    
     assert calibrated_response.confidence == 0.86
+
+
+def test_request_id_propagation():
+    """
+    Verify request ID is propagated from/to headers and logs.
+    """
+    req_id = "test-request-id-12345"
+    response = client.post(
+        "/api/v1/triage",
+        headers={"X-Request-ID": req_id},
+        json={"patient_id": "test_req_id", "message": "I got a small paper cut on my thumb."}
+    )
+    assert response.status_code == 200
+    assert response.headers.get("X-Request-ID") == req_id
+
+
+def test_metrics_endpoint():
+    """
+    Verify /metrics endpoint outputs JSON and Prometheus format correctly.
+    """
+    # 1. JSON output
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    data = response.json()
+    assert "total_requests" in data
+    assert "avg_latency_ms" in data
+    assert "p95_latency_ms" in data
+    assert "avg_validator_node_latency_ms" in data
+
+    # 2. Prometheus output
+    response_prom = client.get("/metrics", headers={"Accept": "text/plain"})
+    assert response_prom.status_code == 200
+    assert "triage_total_requests" in response_prom.text
+
+
+def test_system_health_endpoint():
+    """
+    Verify /system/health deep connection checks respond with API, groq, faiss, cache, and audit status.
+    """
+    response = client.get("/system/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert "status" in data
+    assert data["status"] in ["healthy", "degraded", "unhealthy"]
+    details = data["details"]
+    assert "api" in details
+    assert "groq" in details
+    assert "faiss" in details
+    assert "cache" in details
+    assert "audit_logger" in details
+
+
+def test_audit_logging(monkeypatch):
+    """
+    Verify that clinical actions (override, completion) are securely logged in logs/audit.log
+    without saving any private raw patient text messages.
+    """
+    # Clean audit log file
+    audit_file = "logs/audit.log"
+    if os.path.exists(audit_file):
+        try:
+            os.remove(audit_file)
+        except Exception:
+            pass
+
+    # 1. Completion log
+    payload = {
+        "patient_id": "pat_audit_test",
+        "message": "I got a small paper cut on my thumb."
+    }
+    response = client.post("/api/v1/triage", json=payload)
+    assert response.status_code == 200
+
+    # 2. Check override log
+    # Bypass local rule engine so we proceed to LLM and validator nodes
+    monkeypatch.setattr("app.graph.triage_graph.evaluate_rules", lambda features: None)
+    
+    payload_override = {
+        "patient_id": "pat_audit_override",
+        "message": "I am pregnant and have abdominal pain."
+    }
+    response_override = client.post("/api/v1/triage", json=payload_override)
+    assert response_override.status_code == 200
+
+    # Read audit log
+    assert os.path.exists(audit_file)
+    with open(audit_file, "r", encoding="utf-8") as f:
+        log_lines = f.readlines()
+
+    assert len(log_lines) >= 2
+    
+    # Assert format and no message content
+    import json
+    found_completion = False
+    found_override = False
+    for line in log_lines:
+        try:
+            event = json.loads(line.strip())
+            assert "timestamp" in event
+            assert "request_id" in event
+            assert "patient_id" in event
+            assert "message" not in event
+            assert "symptoms_text" not in event
+            assert "patient_message" not in event
+            
+            if event.get("event_type") == "triage_completed" and event.get("patient_id") == "pat_audit_test":
+                found_completion = True
+                assert "urgency" in event
+                assert "condition" in event
+                
+            if event.get("event_type") == "clinical_override_applied" and event.get("patient_id") == "pat_audit_override":
+                found_override = True
+                assert "original_urgency" in event
+                assert "final_urgency" in event
+        except Exception as e:
+            pytest.fail(f"Audit log line was not valid JSON or failed assertions: {e}")
+            
+    assert found_completion
+    assert found_override
+
+
+def test_structured_logging():
+    """
+    Verify pretty vs JSON structured logging output.
+    """
+    import logging
+    from app.services.logging import JSONFormatter, PrettyFormatter, request_id_var
+    
+    # Create a mock record
+    record = logging.LogRecord(
+        name="test_json",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=10,
+        msg="JSON log message test",
+        args=(),
+        exc_info=None
+    )
+    
+    # Test JSON formatting
+    token = request_id_var.set("test-request-id-123")
+    try:
+        from app.services.logging import CorrelationFilter
+        CorrelationFilter().filter(record)
+        
+        json_fmt = JSONFormatter()
+        formatted_json = json_fmt.format(record)
+        assert "timestamp" in formatted_json
+        assert '"level": "INFO"' in formatted_json
+        assert '"request_id": "test-request-id-123"' in formatted_json
+        assert '"message": "JSON log message test"' in formatted_json
+        
+        # Test Pretty formatting
+        pretty_fmt = PrettyFormatter()
+        formatted_pretty = pretty_fmt.format(record)
+        assert "[INFO]" in formatted_pretty
+        assert "test-request-id-123" in formatted_pretty
+        assert "JSON log message test" in formatted_pretty
+    finally:
+        request_id_var.reset(token)
 
 
 
